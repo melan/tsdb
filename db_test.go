@@ -18,8 +18,11 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"sort"
 	"testing"
+
+	"github.com/oklog/ulid"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/tsdb/labels"
@@ -61,6 +64,31 @@ func query(t testing.TB, q Querier, matchers ...labels.Matcher) map[string][]sam
 	testutil.Ok(t, ss.Err())
 
 	return result
+}
+
+// Ensure that blocks are held in memory in their time order
+// and not in ULID order as they are read from the directory.
+func TestDB_reloadOrder(t *testing.T) {
+	db, close := openTestDB(t, nil)
+	defer close()
+	defer db.Close()
+
+	metas := []*BlockMeta{
+		{ULID: ulid.MustNew(100, nil), MinTime: 90, MaxTime: 100},
+		{ULID: ulid.MustNew(200, nil), MinTime: 70, MaxTime: 80},
+		{ULID: ulid.MustNew(300, nil), MinTime: 100, MaxTime: 110},
+	}
+	for _, m := range metas {
+		bdir := filepath.Join(db.Dir(), m.ULID.String())
+		createEmptyBlock(t, bdir, m)
+	}
+
+	testutil.Ok(t, db.reload())
+	blocks := db.Blocks()
+	testutil.Equals(t, 3, len(blocks))
+	testutil.Equals(t, *metas[1], blocks[0].Meta())
+	testutil.Equals(t, *metas[0], blocks[1].Meta())
+	testutil.Equals(t, *metas[2], blocks[2].Meta())
 }
 
 func TestDataAvailableOnlyAfterCommit(t *testing.T) {
@@ -903,33 +931,41 @@ func TestOverlappingBlocksDetectsAllOverlaps(t *testing.T) {
 
 	testutil.Assert(t, len(OverlappingBlocks(metas)) == 0, "we found unexpected overlaps")
 
-	// Add overlapping blocks.
+	// Add overlapping blocks. We've to establish order again since we aren't interested
+	// in trivial overlaps caused by unorderedness.
+	add := func(ms ...BlockMeta) []BlockMeta {
+		repl := append(append([]BlockMeta{}, metas...), ms...)
+		sort.Slice(repl, func(i, j int) bool {
+			return repl[i].MinTime < repl[j].MinTime
+		})
+		return repl
+	}
 
 	// o1 overlaps with 10-20.
 	o1 := BlockMeta{MinTime: 15, MaxTime: 17}
 	testutil.Equals(t, Overlaps{
 		{Min: 15, Max: 17}: {metas[1], o1},
-	}, OverlappingBlocks(append(metas, o1)))
+	}, OverlappingBlocks(add(o1)))
 
 	// o2 overlaps with 20-30 and 30-40.
 	o2 := BlockMeta{MinTime: 21, MaxTime: 31}
 	testutil.Equals(t, Overlaps{
 		{Min: 21, Max: 30}: {metas[2], o2},
 		{Min: 30, Max: 31}: {o2, metas[3]},
-	}, OverlappingBlocks(append(metas, o2)))
+	}, OverlappingBlocks(add(o2)))
 
 	// o3a and o3b overlaps with 30-40 and each other.
 	o3a := BlockMeta{MinTime: 33, MaxTime: 39}
 	o3b := BlockMeta{MinTime: 34, MaxTime: 36}
 	testutil.Equals(t, Overlaps{
 		{Min: 34, Max: 36}: {metas[3], o3a, o3b},
-	}, OverlappingBlocks(append(metas, o3a, o3b)))
+	}, OverlappingBlocks(add(o3a, o3b)))
 
 	// o4 is 1:1 overlap with 50-60.
 	o4 := BlockMeta{MinTime: 50, MaxTime: 60}
 	testutil.Equals(t, Overlaps{
 		{Min: 50, Max: 60}: {metas[5], o4},
-	}, OverlappingBlocks(append(metas, o4)))
+	}, OverlappingBlocks(add(o4)))
 
 	// o5 overlaps with 60-70, 70-80 and 80-90.
 	o5 := BlockMeta{MinTime: 61, MaxTime: 85}
@@ -937,7 +973,7 @@ func TestOverlappingBlocksDetectsAllOverlaps(t *testing.T) {
 		{Min: 61, Max: 70}: {metas[6], o5},
 		{Min: 70, Max: 80}: {o5, metas[7]},
 		{Min: 80, Max: 85}: {o5, metas[8]},
-	}, OverlappingBlocks(append(metas, o5)))
+	}, OverlappingBlocks(add(o5)))
 
 	// o6a overlaps with 90-100, 100-110 and o6b, o6b overlaps with 90-100 and o6a.
 	o6a := BlockMeta{MinTime: 92, MaxTime: 105}
@@ -945,7 +981,7 @@ func TestOverlappingBlocksDetectsAllOverlaps(t *testing.T) {
 	testutil.Equals(t, Overlaps{
 		{Min: 94, Max: 99}:   {metas[9], o6a, o6b},
 		{Min: 100, Max: 105}: {o6a, metas[10]},
-	}, OverlappingBlocks(append(metas, o6a, o6b)))
+	}, OverlappingBlocks(add(o6a, o6b)))
 
 	// All together.
 	testutil.Equals(t, Overlaps{
@@ -955,7 +991,7 @@ func TestOverlappingBlocksDetectsAllOverlaps(t *testing.T) {
 		{Min: 50, Max: 60}: {metas[5], o4},
 		{Min: 61, Max: 70}: {metas[6], o5}, {Min: 70, Max: 80}: {o5, metas[7]}, {Min: 80, Max: 85}: {o5, metas[8]},
 		{Min: 94, Max: 99}: {metas[9], o6a, o6b}, {Min: 100, Max: 105}: {o6a, metas[10]},
-	}, OverlappingBlocks(append(metas, o1, o2, o3a, o3b, o4, o5, o6a, o6b)))
+	}, OverlappingBlocks(add(o1, o2, o3a, o3b, o4, o5, o6a, o6b)))
 
 	// Additional case.
 	var nc1 []BlockMeta
